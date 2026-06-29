@@ -47,11 +47,13 @@ k7_regdb(const float *__restrict__ A, const float *__restrict__ B,
 
     // bring one tile from gmem into smem[buf]. A is stored with swizzle
     auto load = [&](int buf, int t) {
+#pragma unroll
         for (int off = 0; off + rowStrideA <= BM; off += rowStrideA) {
             int m = innerRowA + off;
             __pipeline_memcpy_async(&As[buf * sAs + m * BK + swzK(m, innerColA * 4)],
                                     &A[m * K + t * BK + innerColA * 4], 16);
         }
+#pragma unroll
         for (int off = 0; off + rowStrideB <= BK; off += rowStrideB)
             __pipeline_memcpy_async(
                 &Bs[buf * sBs + (innerRowB + off) * BN + innerColB * 4],
@@ -69,7 +71,9 @@ k7_regdb(const float *__restrict__ A, const float *__restrict__ B,
 
         // bring one row of B into regN[nbuf]
         auto loadB = [&](int nbuf, int k) {
+#pragma unroll
             for (int wsc = 0; wsc < WNITER; ++wsc)
+#pragma unroll
                 for (int jj = 0; jj < TN; jj += 4) {
                     float4 bv = *reinterpret_cast<const float4 *>(
                         &Bs[cur * sBs + k * BN + warpCol * WN + wsc * WSUBN +
@@ -81,9 +85,12 @@ k7_regdb(const float *__restrict__ A, const float *__restrict__ B,
                 }
         };
 
+#pragma unroll
         for (int c = 0; c < BK / 4; ++c) {
             // A: 4 k of the c-block as float4 in one go
+#pragma unroll
             for (int wsr = 0; wsr < WMITER; ++wsr)
+#pragma unroll
                 for (int i = 0; i < TM; ++i) {
                     int _m = warpRow * WM + wsr * WSUBM + threadRowInWarp * TM + i;
                     Af[wsr * TM + i] = *reinterpret_cast<const float4 *>(
@@ -94,33 +101,49 @@ k7_regdb(const float *__restrict__ A, const float *__restrict__ B,
             // Af's components are literals so the 4 kk are unrolled.
             loadB(0, 4 * c + 0);
             loadB(1, 4 * c + 1);
+#pragma unroll
             for (int wsr = 0; wsr < WMITER; ++wsr) // kk=0: Af.x * regN[0]
+#pragma unroll
                 for (int i = 0; i < TM; ++i) {
                     float a = Af[wsr * TM + i].x;
+#pragma unroll
                     for (int wsc = 0; wsc < WNITER; ++wsc)
+#pragma unroll
                         for (int j = 0; j < TN; ++j)
                             threadResults[(wsr * TM + i) * (WNITER * TN) + wsc * TN + j] += a * regN[0][wsc * TN + j];
                 }
             loadB(0, 4 * c + 2);
+#pragma unroll
             for (int wsr = 0; wsr < WMITER; ++wsr) // kk=1: Af.y * regN[1]
+#pragma unroll
                 for (int i = 0; i < TM; ++i) {
                     float a = Af[wsr * TM + i].y;
+#pragma unroll
                     for (int wsc = 0; wsc < WNITER; ++wsc)
+#pragma unroll
                         for (int j = 0; j < TN; ++j)
                             threadResults[(wsr * TM + i) * (WNITER * TN) + wsc * TN + j] += a * regN[1][wsc * TN + j];
                 }
             loadB(1, 4 * c + 3);
+#pragma unroll
             for (int wsr = 0; wsr < WMITER; ++wsr) // kk=2: Af.z * regN[0]
+#pragma unroll
                 for (int i = 0; i < TM; ++i) {
                     float a = Af[wsr * TM + i].z;
+#pragma unroll
                     for (int wsc = 0; wsc < WNITER; ++wsc)
+#pragma unroll
                         for (int j = 0; j < TN; ++j)
                             threadResults[(wsr * TM + i) * (WNITER * TN) + wsc * TN + j] += a * regN[0][wsc * TN + j];
                 }
+#pragma unroll
             for (int wsr = 0; wsr < WMITER; ++wsr) // kk=3: Af.w * regN[1]
+#pragma unroll
                 for (int i = 0; i < TM; ++i) {
                     float a = Af[wsr * TM + i].w;
+#pragma unroll
                     for (int wsc = 0; wsc < WNITER; ++wsc)
+#pragma unroll
                         for (int j = 0; j < TN; ++j)
                             threadResults[(wsr * TM + i) * (WNITER * TN) + wsc * TN + j] += a * regN[1][wsc * TN + j];
                 }
@@ -130,10 +153,14 @@ k7_regdb(const float *__restrict__ A, const float *__restrict__ B,
         if (loadTile < numTiles) load(loadTile % STAGES, loadTile);
     }
 
+#pragma unroll
     for (int wsr = 0; wsr < WMITER; ++wsr)
+#pragma unroll
         for (int wsc = 0; wsc < WNITER; ++wsc) {
             float *Csub = C + (wsr * WSUBM) * N + wsc * WSUBN;
+#pragma unroll
             for (int i = 0; i < TM; ++i)
+#pragma unroll
                 for (int j = 0; j < TN; j += 4) {
                     int idx = (wsr * TM + i) * (WNITER * TN) + wsc * TN + j;
                     float4 t;
