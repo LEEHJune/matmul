@@ -1,14 +1,13 @@
 #pragma once
 #include <cuda_pipeline.h>
-// K6's cp.async multi-stage plus register-level double buffering.
-// in the smem->register step A is pulled out as float4 in one go,
-// and B's next-k values are pre-loaded into two regN buffers to overlap with compute.
-// pointers are taken as __restrict__ so the compiler can schedule loads more freely.
+// K7 (cp.async multistage + reg-DB) plus split-K. the K reduction is sliced across gridDim.z
+// so tall/skinny shapes get more blocks than M/BM * N/BN alone would give.
+// each z-slice computes a partial C over its K-chunk and atomicAdds into the C.
 template <int BM, int BN, int BK, int WM, int WN, int WNITER, int TM, int TN,
-          int NUM_THREADS, int STAGES>
+          int NUM_THREADS, int STAGES, int SPLITK>
 __global__ void __launch_bounds__(NUM_THREADS)
-k7_regdb(const float *__restrict__ A, const float *__restrict__ B,
-         float *__restrict__ C, int M, int N, int K) {
+k8_splitk(const float *__restrict__ A, const float *__restrict__ B,
+          float *__restrict__ C, int M, int N, int K) {
     constexpr int WMITER = (WM * WN) / (32 * TM * TN * WNITER);
     constexpr int WSUBM = WM / WMITER;
     constexpr int WSUBN = WN / WNITER;
@@ -30,8 +29,16 @@ k7_regdb(const float *__restrict__ A, const float *__restrict__ B,
     float *As = smem;
     float *Bs = smem + STAGES * sAs;
 
-    A += cRow * BM * K;
-    B += cCol * BN;
+    // this block's K-slice. ceil split so an uneven SPLITK still covers all of K
+    const int totalTiles = K / BK;
+    const int per = (totalTiles + SPLITK - 1) / SPLITK;
+    const int kTileStart = blockIdx.z * per; // in BK units
+    int numTiles = totalTiles - kTileStart;
+    if (numTiles > per) numTiles = per;
+    if (numTiles <= 0) return; // leftover z-slice with no work
+
+    A += cRow * BM * K + kTileStart * BK;     // K is the column axis of A
+    B += cCol * BN + (kTileStart * BK) * N;   // K is the row axis of B
     C += (cRow * BM + warpRow * WM) * N + cCol * BN + warpCol * WN;
 
     const int innerRowA = threadIdx.x / (BK / 4);
@@ -40,12 +47,9 @@ k7_regdb(const float *__restrict__ A, const float *__restrict__ B,
     const int innerColB = threadIdx.x % (BN / 4);
 
     float threadResults[WMITER * TM * WNITER * TN] = {0.0f};
-    float4 Af[WMITER * TM]; // 4 k of the c-block. zero per-kk LDS
-    float regN[2][WNITER * TN]; // layer-2 DB. B for the next kk ahead of time
+    float4 Af[WMITER * TM];
+    float regN[2][WNITER * TN];
 
-    const int numTiles = K / BK;
-
-    // bring one tile from gmem into smem[buf]. A is stored with swizzle
     auto load = [&](int buf, int t) {
 #pragma unroll
         for (int off = 0; off + rowStrideA <= BM; off += rowStrideA) {
@@ -67,17 +71,15 @@ k7_regdb(const float *__restrict__ A, const float *__restrict__ B,
     for (int tile = 0; tile < numTiles; ++tile) {
         // tail fix: once prefetch runs out, shrink the wait window so the last STAGES-2 tiles
         // still get their cp.async fully waited. else they read a buffer whose async copy is
-        // still in flight (__syncthreads doesn't order cp.async) -> stale-buffer RAW race.
+        // still in flight (__syncthreads doesn't order cp.async) -> race.
         const int ahead = numTiles - 1 - tile;
         __pipeline_wait_prior(ahead < STAGES - 2 ? ahead : STAGES - 2);
         __syncthreads();
         const int cur = tile % STAGES;
 
-        // issue the next tile's cp.async BEFORE compute (canonical multistage ordering)
         const int loadTile = tile + STAGES - 1;
         if (loadTile < numTiles) load(loadTile % STAGES, loadTile);
 
-        // bring one row of B into regN[nbuf]
         auto loadB = [&](int nbuf, int k) {
 #pragma unroll
             for (int wsc = 0; wsc < WNITER; ++wsc)
@@ -95,7 +97,6 @@ k7_regdb(const float *__restrict__ A, const float *__restrict__ B,
 
 #pragma unroll
         for (int c = 0; c < BK / 4; ++c) {
-            // A: 4 k of the c-block as float4 in one go
 #pragma unroll
             for (int wsr = 0; wsr < WMITER; ++wsr)
 #pragma unroll
@@ -105,12 +106,10 @@ k7_regdb(const float *__restrict__ A, const float *__restrict__ B,
                         &As[cur * sAs + _m * BK + swzK(_m, 4 * c)]);
                 }
 
-            // pre-load the next kk's B before the current FMA. toggle regN 0/1.
-            // Af's components are literals so the 4 kk are unrolled.
             loadB(0, 4 * c + 0);
             loadB(1, 4 * c + 1);
 #pragma unroll
-            for (int wsr = 0; wsr < WMITER; ++wsr) // kk=0: Af.x * regN[0]
+            for (int wsr = 0; wsr < WMITER; ++wsr) // kk=0
 #pragma unroll
                 for (int i = 0; i < TM; ++i) {
                     float a = Af[wsr * TM + i].x;
@@ -122,7 +121,7 @@ k7_regdb(const float *__restrict__ A, const float *__restrict__ B,
                 }
             loadB(0, 4 * c + 2);
 #pragma unroll
-            for (int wsr = 0; wsr < WMITER; ++wsr) // kk=1: Af.y * regN[1]
+            for (int wsr = 0; wsr < WMITER; ++wsr) // kk=1
 #pragma unroll
                 for (int i = 0; i < TM; ++i) {
                     float a = Af[wsr * TM + i].y;
@@ -134,7 +133,7 @@ k7_regdb(const float *__restrict__ A, const float *__restrict__ B,
                 }
             loadB(1, 4 * c + 3);
 #pragma unroll
-            for (int wsr = 0; wsr < WMITER; ++wsr) // kk=2: Af.z * regN[0]
+            for (int wsr = 0; wsr < WMITER; ++wsr) // kk=2
 #pragma unroll
                 for (int i = 0; i < TM; ++i) {
                     float a = Af[wsr * TM + i].z;
@@ -145,7 +144,7 @@ k7_regdb(const float *__restrict__ A, const float *__restrict__ B,
                             threadResults[(wsr * TM + i) * (WNITER * TN) + wsc * TN + j] += a * regN[0][wsc * TN + j];
                 }
 #pragma unroll
-            for (int wsr = 0; wsr < WMITER; ++wsr) // kk=3: Af.w * regN[1]
+            for (int wsr = 0; wsr < WMITER; ++wsr) // kk=3
 #pragma unroll
                 for (int i = 0; i < TM; ++i) {
                     float a = Af[wsr * TM + i].w;
@@ -158,44 +157,58 @@ k7_regdb(const float *__restrict__ A, const float *__restrict__ B,
         }
     }
 
+    // write C. SPLITK==1 has no cross-block contention, so store exactly like K7 (float4).
+    // SPLITK>1 means several z-slices land on the same element -> must atomicAdd.
 #pragma unroll
     for (int wsr = 0; wsr < WMITER; ++wsr)
 #pragma unroll
         for (int wsc = 0; wsc < WNITER; ++wsc) {
             float *Csub = C + (wsr * WSUBM) * N + wsc * WSUBN;
+            if constexpr (SPLITK == 1) {
 #pragma unroll
-            for (int i = 0; i < TM; ++i)
+                for (int i = 0; i < TM; ++i)
 #pragma unroll
-                for (int j = 0; j < TN; j += 4) {
-                    int idx = (wsr * TM + i) * (WNITER * TN) + wsc * TN + j;
-                    float4 t;
-                    t.x = threadResults[idx + 0];
-                    t.y = threadResults[idx + 1];
-                    t.z = threadResults[idx + 2];
-                    t.w = threadResults[idx + 3];
-                    reinterpret_cast<float4 *>(
-                        &Csub[(threadRowInWarp * TM + i) * N +
-                              threadColInWarp * TN + j])[0] = t;
-                }
+                    for (int j = 0; j < TN; j += 4) {
+                        int idx = (wsr * TM + i) * (WNITER * TN) + wsc * TN + j;
+                        float4 t;
+                        t.x = threadResults[idx + 0];
+                        t.y = threadResults[idx + 1];
+                        t.z = threadResults[idx + 2];
+                        t.w = threadResults[idx + 3];
+                        reinterpret_cast<float4 *>(
+                            &Csub[(threadRowInWarp * TM + i) * N +
+                                  threadColInWarp * TN + j])[0] = t;
+                    }
+            } else {
+#pragma unroll
+                for (int i = 0; i < TM; ++i)
+#pragma unroll
+                    for (int j = 0; j < TN; ++j) {
+                        int idx = (wsr * TM + i) * (WNITER * TN) + wsc * TN + j;
+                        atomicAdd(&Csub[(threadRowInWarp * TM + i) * N +
+                                        threadColInWarp * TN + j],
+                                  threadResults[idx]);
+                    }
+            }
         }
 }
 
 template <int BM, int BN, int BK, int WM, int WN, int WNITER, int TM, int TN,
-          int NUM_THREADS, int STAGES>
-inline void launch_k7_cfg(const float *A, const float *B, float *C,
+          int NUM_THREADS, int STAGES, int SPLITK>
+inline void launch_k8_cfg(const float *A, const float *B, float *C,
                           int M, int N, int K) {
     constexpr int smemBytes = STAGES * (BM * BK + BK * BN) * (int)sizeof(float);
-    auto kern = k7_regdb<BM, BN, BK, WM, WN, WNITER, TM, TN, NUM_THREADS, STAGES>;
+    auto kern = k8_splitk<BM, BN, BK, WM, WN, WNITER, TM, TN, NUM_THREADS, STAGES, SPLITK>;
     if (smemBytes > 48 * 1024)
         cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, smemBytes);
     dim3 block(NUM_THREADS);
-    dim3 grid(N / BN, M / BM);
+    dim3 grid(N / BN, M / BM, SPLITK);
     kern<<<grid, block, smemBytes>>>(A, B, C, M, N, K);
 }
 
-inline void launch_k7(const float *A, const float *B, float *C,
+inline void launch_k8(const float *A, const float *B, float *C,
                       int M, int N, int K) {
-    // 128x256 tile, warp 64x64, 8x8 thread, 3-stage (sweep best, ~95% vs cuBLAS).
-    // wide-N block + 256 threads gives reg-DB enough headroom without spilling.
-    launch_k7_cfg<128, 256, 16, 64, 64, 2, 8, 8, 256, 3>(A, B, C, M, N, K);
+    // default: SPLITK=1, i.e. split-K OFF -> identical to K7 (float4 store, no atomics).
+    // the real split is set per-shape from main_shape (tall needs it to get more blocks).
+    launch_k8_cfg<128, 256, 16, 64, 64, 2, 8, 8, 256, 3, 1>(A, B, C, M, N, K);
 }

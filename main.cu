@@ -10,13 +10,13 @@
 #include "kernels/k5_warptile.cuh"
 #include "kernels/k6_cpasync.cuh"
 #include "kernels/k7_regdb.cuh"
+#include "kernels/k8_splitk.cuh"
 
 static void print_device_info() {
     int dev = 0;
     CUDA_CHECK(cudaGetDevice(&dev));
     cudaDeviceProp p;
     CUDA_CHECK(cudaGetDeviceProperties(&p, dev));
-    // since CUDA 13 memoryClockRate is gone from prop, so read it as an attribute. used for the roofline peak BW.
     int mem_clk_khz = 0;
     CUDA_CHECK(cudaDeviceGetAttribute(&mem_clk_khz, cudaDevAttrMemoryClockRate, dev));
     double mem_bw = 2.0 * (double)mem_clk_khz * 1e3 *
@@ -86,17 +86,18 @@ int main(int argc, char **argv) {
     };
 
     // one per kernel. each calls its own launch_kX wrapper from its header.
-    // the tuning sweep is done and stripped out. the chosen config is baked into the wrapper.
-    bench("K0 naive",        [&] { launch_k0(dA, dB, dC, M, N, K); });
-    bench("K1 coalesce",     [&] { launch_k1(dA, dB, dC, M, N, K); });
-    bench("K2 tiling",       [&] { launch_k2(dA, dB, dC, M, N, K); });
-    bench("K3 micro-tiling", [&] { launch_k3(dA, dB, dC, M, N, K); });
-    bench("K4 vectorize",    [&] { launch_k4(dA, dB, dC, M, N, K); });
-    bench("K5 warptile",     [&] { launch_k5(dA, dB, dC, M, N, K); });
+    // the tuning sweep is done and stripped out. the chosen config is in the wrapper
+    bench("K0 naive  blk32x32",                                          [&] { launch_k0(dA, dB, dC, M, N, K); });
+    bench("K1 coalesce  BS32",                                           [&] { launch_k1(dA, dB, dC, M, N, K); });
+    bench("K2 tiling  TILE32",                                           [&] { launch_k2(dA, dB, dC, M, N, K); });
+    bench("K3 micro  BM128 BN128 BK8 TM8 TN8",                           [&] { launch_k3(dA, dB, dC, M, N, K); });
+    bench("K4 vec  BM128 BN128 BK32 TM8 TN8",                            [&] { launch_k4(dA, dB, dC, M, N, K); });
+    bench("K5 warptile  BM128 BN128 BK16 WM64 WN64 WIT2 TM8 TN8 NT128",  [&] { launch_k5(dA, dB, dC, M, N, K); });
 
     // cp.async breakthrough track
-    bench("K6 cp.async",     [&] { launch_k6(dA, dB, dC, M, N, K); });  // best. cp.async multistage + swizzle + float4
-    bench("K7 +reg-DB",      [&] { launch_k7(dA, dB, dC, M, N, K); });  // K6 + __restrict__ + layer-2 reg-DB
+    bench("K6 cp.async  BM256 BN128 BK16 WM64 WN64 WIT2 TM8 TN8 NT256 S3 swz vec4", [&] { launch_k6(dA, dB, dC, M, N, K); });
+    bench("K7 reg-DB  BM128 BN256 BK16 WM64 WN64 WIT2 TM8 TN8 NT256 S3",            [&] { launch_k7(dA, dB, dC, M, N, K); });
+    bench("K8 split-K  BM128 BN256 BK16 WM64 WN64 WIT2 TM8 TN8 NT256 S3 SK1",       [&] { launch_k8(dA, dB, dC, M, N, K); });
 
     print_header();
     for (auto &r : results) print_row(r, baseline);
