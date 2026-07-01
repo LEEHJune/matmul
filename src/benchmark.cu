@@ -87,6 +87,7 @@ static void run_square(int N, int reps) {
     print_header();
     for (auto &r : results) print_row(r, baseline);
     printf("\n");
+    write_csv("results/square.csv", "cuda_core", "square", M, N, K, results, baseline);
 
     cublasDestroy(handle);
     cudaFree(dA); cudaFree(dB); cudaFree(dC); cudaFree(dRef);
@@ -157,6 +158,7 @@ static void run_tensor(int N, int reps) {
     print_header();
     for (auto &r : results) print_row(r, baseline);
     printf("\n");
+    write_csv("results/tensor.csv", "tensor_core", "square", M, N, K, results, baseline);
 
     cublasDestroy(handle);
     cudaFree(dA); cudaFree(dB); cudaFree(dC); cudaFree(dRef);
@@ -170,6 +172,7 @@ static void run_shape(int reps) {
     cublasHandle_t handle;
     CUBLAS_CHECK(cublasCreate(&handle));
     const float alpha = 1.0f, beta = 0.0f;
+    bool firstShape = true;   // first shape writes the CSV header, the rest append
 
     // run one problem shape: alloc, build cuBLAS reference, bench a set of configs, print table.
     auto run_shape_one = [&](const char *tag, int M, int N, int K, auto configs) {
@@ -221,6 +224,8 @@ static void run_shape(int reps) {
             printf("%-46s %8.3f %9.0f %7.0f%% %8.0f%s\n", r.name.c_str(), r.ms, r.gflops,
                    pct, operand_gbps(M, N, K, r.ms), r.pass ? "" : "  FAIL");
         }
+        write_csv("results/shape.csv", "cuda_core", tag, M, N, K, results, baseline, !firstShape);
+        firstShape = false;
 
         cudaFree(dA); cudaFree(dB); cudaFree(dC); cudaFree(dRef);
     };
@@ -250,6 +255,7 @@ int main(int argc, char **argv) {
     int reps = (argc > 3) ? atoi(argv[3]) : 20;
 
     print_device_info();
+    ensure_dir("results");   // so results/*.csv can be written
 
     bool all = (mode == "all");
     if (all || mode == "square") run_square(N, reps);

@@ -10,6 +10,11 @@
 #include <string>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#if defined(_WIN32)
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#endif
 
 #define CUDA_CHECK(call)                                                        \
     do {                                                                        \
@@ -123,4 +128,32 @@ inline void print_row(const Result &r, double baseline_gflops) {
     // only tack on FAIL when the check fails
     printf("%-72s %8.2f %9.0f %7.0f%%%s\n", r.name.c_str(), r.ms, r.gflops, pct,
            r.pass ? "" : "   FAIL");
+}
+
+// make a directory if it isn't there (so results/ exists before we write into it)
+inline void ensure_dir(const char *d) {
+#if defined(_WIN32)
+    _mkdir(d);
+#else
+    mkdir(d, 0777);
+#endif
+}
+
+// dump the table to a CSV so runs can be saved / diffed / plotted. one schema for every track.
+// append=false writes header+rows (fresh file); append=true adds rows only.
+inline void write_csv(const char *path, const char *track, const char *shape,
+                      int M, int N, int K, const std::vector<Result> &results,
+                      double baseline, bool append = false) {
+    FILE *f = fopen(path, append ? "a" : "w");
+    if (!f) { fprintf(stderr, "warn: cannot write %s\n", path); return; }
+    if (!append)
+        fprintf(f, "track,shape,kernel,ms,gflops,pct_cublas,gbps,max_rel,pass\n");
+    for (const auto &r : results) {
+        double pct = baseline > 0 ? 100.0 * r.gflops / baseline : 0.0;
+        fprintf(f, "%s,\"%s\",\"%s\",%.4f,%.1f,%.2f,%.1f,%.3e,%d\n", track, shape,
+                r.name.c_str(), r.ms, r.gflops, pct, operand_gbps(M, N, K, r.ms),
+                r.max_rel, r.pass ? 1 : 0);
+    }
+    fclose(f);
+    printf("[saved] %s\n", path);
 }
