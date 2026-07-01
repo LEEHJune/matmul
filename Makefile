@@ -1,31 +1,31 @@
 
-NVCC ?= nvcc
-ARCH ?= sm_89   # RTX 4090 (Ada)
-NVCCFLAGS = -O3 -std=c++17 -arch=$(ARCH) -lineinfo
-LIBS = -lcublas
+NVCC  ?= nvcc
+ARCH  ?= sm_89
+NVCCFLAGS = -O3 -std=c++17 -arch=$(ARCH) -lineinfo -Iinclude -Isrc
+LIBS  = -lcublas
 
-SRC = main.cu
-HDRS = bench.cuh kernels/k0_naive.cuh kernels/k1_coalesce.cuh \
-       kernels/k2_tiling.cuh kernels/k3_microtile.cuh kernels/k4_vectorize.cuh \
-       kernels/k5_warptile.cuh kernels/k6_cpasync.cuh kernels/k7_regdb.cuh \
-       kernels/k8_splitk.cuh
+BIN = bin/benchmark
+SRC = src/benchmark.cu
+HDRS = include/bench.cuh $(wildcard src/*.cuh)
 
-matmul: $(SRC) $(HDRS)
-	$(NVCC) $(NVCCFLAGS) $(SRC) -o matmul $(LIBS)
+$(BIN): $(SRC) $(HDRS)
+	@mkdir -p bin
+	$(NVCC) $(NVCCFLAGS) $(SRC) -o $(BIN) $(LIBS)
 
-run: matmul
-	./matmul
+build: $(BIN)
 
-# skinny (M=8) / tall (N=8) GEMM
-shape: main_shape.cu $(HDRS)
-	$(NVCC) $(NVCCFLAGS) main_shape.cu -o shape $(LIBS)
-	./shape
+# full benchmark
+run: $(BIN)
+	bash scripts/benchmark.sh
 
-# per-kernel register count and spill bytes. handy for comparing k6_cpasync vs k7_regdb
-regs:
-	$(NVCC) $(NVCCFLAGS) -Xptxas -v -c $(SRC) -o /dev/null
+# just one track: make square / make shape / make tensor
+# square = Cuda Core Square GEMM (4092^3)
+# shape = Cuda Core Tall / Skinny GEMM
+# tensor = Tensor Core Square GEMM
+square shape tensor: $(BIN)
+	./$(BIN) $@
 
 clean:
-	rm -f matmul shape
+	rm -rf bin
 
-.PHONY: run clean regs shape
+.PHONY: build run square shape tensor clean

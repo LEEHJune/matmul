@@ -1,6 +1,7 @@
 #pragma once
-// shared bench helpers. make the inputs, check against cuBLAS, time with CUDA events, print the table.
-// problem: C = A * B, row-major FP32. here M=N=K=4096.
+// shared bench helpers for both tracks (CUDA-core SGEMM + Tensor-core TF32).
+// make the inputs, check against cuBLAS, time with CUDA events, print the table.
+// problem: C = A * B, row-major, float buffers. square case is M=N=K=4096.
 
 #include <cstdio>
 #include <cstdlib>
@@ -85,6 +86,13 @@ inline double gflops(int M, int N, int K, float ms) {
     return (2.0 * (double)M * (double)N * (double)K) / (ms * 1e-3) / 1e9; // 2*M*N*K FLOP
 }
 
+// effective operand bandwidth: A+B+C touched once. the meaningful metric in the memory-bound
+// (skinny/tall) regime; for the square case it just sits far below peak.
+inline double operand_gbps(int M, int N, int K, float ms) {
+    double bytes = ((double)M * K + (double)K * N + (double)M * N) * sizeof(float);
+    return bytes / (ms * 1e-3) / 1e9;
+}
+
 struct Result {
     std::string name;
     float ms;
@@ -93,13 +101,26 @@ struct Result {
     bool pass;
 };
 
+inline void print_device_info() {
+    int dev = 0;
+    CUDA_CHECK(cudaGetDevice(&dev));
+    cudaDeviceProp p;
+    CUDA_CHECK(cudaGetDeviceProperties(&p, dev));
+    int mem_clk_khz = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&mem_clk_khz, cudaDevAttrMemoryClockRate, dev));
+    double mem_bw = 2.0 * (double)mem_clk_khz * 1e3 *
+                    ((double)p.memoryBusWidth / 8.0) / 1e9;
+    printf("Device: %s  (sm_%d%d, %d SMs, %.0f GB/s peak BW)\n",
+           p.name, p.major, p.minor, p.multiProcessorCount, mem_bw);
+}
+
 inline void print_header() {
-    printf("\n%-22s %8s %9s %8s\n", "kernel", "ms", "GFLOP/s", "vs cuBLAS");
+    printf("\n%-72s %8s %9s %8s\n", "kernel (config)", "ms", "GFLOP/s", "vs cuBLAS");
 }
 
 inline void print_row(const Result &r, double baseline_gflops) {
     double pct = baseline_gflops > 0 ? 100.0 * r.gflops / baseline_gflops : 0.0;
     // only tack on FAIL when the check fails
-    printf("%-22s %8.2f %9.0f %7.0f%%%s\n", r.name.c_str(), r.ms, r.gflops, pct,
+    printf("%-72s %8.2f %9.0f %7.0f%%%s\n", r.name.c_str(), r.ms, r.gflops, pct,
            r.pass ? "" : "   FAIL");
 }

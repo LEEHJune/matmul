@@ -1,7 +1,6 @@
 #pragma once
 // micro-tiling plus memory-access tuning.
-// As is stored transposed in SMEM, so reading it into registers hits contiguous
-// addresses and comes in as one LDS.128.
+// As is stored transposed in SMEM, so reading it into registers hits contiguous addresses 
 // gmem<->smem transfers and the C output are grouped as float4 to cut the load/store
 // instruction count to a quarter.
 // assumes BK, BN, TN are multiples of 4.

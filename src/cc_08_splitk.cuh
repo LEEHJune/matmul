@@ -209,6 +209,7 @@ inline void launch_k8_cfg(const float *A, const float *B, float *C,
 inline void launch_k8(const float *A, const float *B, float *C,
                       int M, int N, int K) {
     // default: SPLITK=1, i.e. split-K OFF -> identical to K7 (float4 store, no atomics).
-    // the real split is set per-shape from main_shape (tall needs it to get more blocks).
+    // bump SPLITK>1 to slice the K reduction across gridDim.z (more blocks) -- only worth it
+    // for shapes that can't fill the SMs (tall/skinny); on square it just adds atomic overhead.
     launch_k8_cfg<128, 256, 16, 64, 64, 2, 8, 8, 256, 3, 1>(A, B, C, M, N, K);
 }

@@ -72,7 +72,11 @@ k6_cpasync(const float *__restrict__ A, const float *__restrict__ B,
     for (int s = 0; s < STAGES - 1; ++s) load(s, s);
 
     for (int tile = 0; tile < numTiles; ++tile) {
-        __pipeline_wait_prior(STAGES - 2); // make sure this tile has arrived. the rest stay in-flight
+        // tail fix: once prefetch runs out, shrink the wait window so the last STAGES-2 tiles
+        // still get their cp.async fully waited. else they read a buffer whose async copy is
+        // still in flight (__syncthreads doesn't order cp.async) -> stale-buffer RAW race.
+        const int ahead = numTiles - 1 - tile;
+        __pipeline_wait_prior(ahead < STAGES - 2 ? ahead : STAGES - 2);
         __syncthreads();
         const int cur = tile % STAGES;
 
