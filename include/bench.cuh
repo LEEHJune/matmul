@@ -61,8 +61,7 @@ inline float max_rel_error(const float *d_x, const float *d_ref, int n) {
     return maxabs / (maxref + 1e-12f);
 }
 
-// launch = a lambda that fires the kernel once. run warmups, then time each rep and return the min ms.
-// min instead of mean since the rep with the least jitter is closest to real peak, so it's more repeatable.
+// launch = a lambda that fires the kernel once. run warmups, then time each rep and return the average ms.
 template <typename F>
 inline float time_ms(F launch, int warmup, int reps) {
     for (int i = 0; i < warmup; ++i) launch();
@@ -72,7 +71,7 @@ inline float time_ms(F launch, int warmup, int reps) {
     CUDA_CHECK(cudaEventCreate(&start));
     CUDA_CHECK(cudaEventCreate(&stop));
 
-    float best = 1e30f;
+    float total = 0;
     for (int i = 0; i < reps; ++i) {
         CUDA_CHECK(cudaEventRecord(start));
         launch();
@@ -80,11 +79,11 @@ inline float time_ms(F launch, int warmup, int reps) {
         CUDA_CHECK(cudaEventSynchronize(stop));
         float ms = 0.0f;
         CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
-        if (ms < best) best = ms;
+        total += ms / reps;
     }
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
-    return best;
+    return total;
 }
 
 inline double gflops(int M, int N, int K, float ms) {
